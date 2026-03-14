@@ -1,0 +1,217 @@
+//
+// Created by Hang XU on 22/10/2025.
+//
+#include "buffer_utils.hpp"
+#include "peripheral_utils.hpp"
+#include "task_defs.hpp"
+
+extern "C" {
+#include "fdcan.h"
+}
+
+namespace aim::ecat::task::dji_motor {
+    DJI_MOTOR::DJI_MOTOR(buffer::Buffer *buffer) : CanRunnable(true, TaskType::DJI_MOTOR) {
+        init_peripheral(peripheral::Type::PERIPHERAL_CAN);
+        switch (buffer->read_uint8(buffer::EndianType::LITTLE)) {
+            case 0x01: {
+                connection_lost_action_ = ConnectionLostAction::KEEP_LAST;
+                break;
+            }
+            case 0x02: {
+                connection_lost_action_ = ConnectionLostAction::RESET_TO_DEFAULT;
+                break;
+            }
+            default: {
+            }
+        }
+
+        period = buffer->read_uint16(buffer::EndianType::LITTLE);
+
+        can_id_type_ = FDCAN_STANDARD_ID;
+        shared_tx_header_.Identifier = buffer->read_uint32(buffer::EndianType::LITTLE);
+        shared_tx_header_.IdType = FDCAN_STANDARD_ID;
+        shared_tx_header_.TxFrameType = FDCAN_DATA_FRAME;
+        shared_tx_header_.DataLength = 8;
+        shared_tx_header_.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+        shared_tx_header_.BitRateSwitch = FDCAN_BRS_OFF;
+        shared_tx_header_.FDFormat = FDCAN_CLASSIC_CAN;
+        shared_tx_header_.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+        shared_tx_header_.MessageMarker = 0;
+
+        for (Motor &motor: motors_) {
+            motor.report_packet_id = buffer->read_uint32(buffer::EndianType::LITTLE);
+            if (motor.report_packet_id != 0) {
+                motor.is_exist = true;
+
+                if (shared_tx_header_.Identifier == 0x200) {
+                    // c610/c620 id1-4
+                    motor.cmd_packet_idx = motor.report_packet_id - 0x201;
+                } else if (shared_tx_header_.Identifier == 0x1ff
+                           || shared_tx_header_.Identifier == 0x1fe) {
+                    // c610/c620 id5-8
+                    // or 6020 id1-4
+                    motor.cmd_packet_idx = motor.report_packet_id - 0x205;
+                } else if (shared_tx_header_.Identifier == 0x2ff
+                           || shared_tx_header_.Identifier == 0x2fe) {
+                    // 6020 id5-8
+                    motor.cmd_packet_idx = motor.report_packet_id - 0x209;
+                }
+            }
+        }
+
+        switch (buffer->read_uint8(buffer::EndianType::LITTLE)) {
+            case 0x01: {
+                can_inst_ = &hfdcan1;
+                break;
+            }
+            case 0x02: {
+                can_inst_ = &hfdcan2;
+                break;
+            }
+            default: {
+            }
+        }
+
+        for (Motor &motor: motors_) {
+            if (!motor.is_exist) {
+                continue;
+            }
+            switch (buffer->read_uint8(buffer::EndianType::LITTLE)) {
+                case 0x01: {
+                    motor.mode = CtrlMode::OPEN_LOOP_CURRENT;
+                    break;
+                }
+                case 0x02: {
+                    motor.mode = CtrlMode::SPEED;
+                    motor.speed_pid.basic_init(
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE)
+                    );
+                    break;
+                }
+                case 0x03: {
+                    motor.mode = CtrlMode::SINGLE_ROUND_POSITION;
+                    motor.speed_pid.basic_init(
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE)
+                    );
+                    motor.angle_pid.basic_init(
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE),
+                        buffer->read_float(buffer::EndianType::LITTLE)
+                    );
+                    break;
+                }
+                default: {
+                }
+            }
+        }
+    }
+
+    void DJI_MOTOR::write_to_master(buffer::Buffer *slave_to_master_buf) {
+        for (Motor &motor: motors_) {
+            if (!motor.is_exist) {
+                continue;
+            }
+            slave_to_master_buf->write_uint8(buffer::EndianType::LITTLE, motor.is_online());
+            slave_to_master_buf->write_uint16(buffer::EndianType::LITTLE, motor.report.ecd.get());
+            slave_to_master_buf->write_int16(buffer::EndianType::LITTLE, motor.report.rpm.get());
+            slave_to_master_buf->write_int16(buffer::EndianType::LITTLE, motor.report.current.get());
+            slave_to_master_buf->write_uint8(buffer::EndianType::LITTLE, motor.report.temperature.get());
+            slave_to_master_buf->write_uint8(buffer::EndianType::LITTLE, motor.report.error.get());
+        }
+    }
+
+    void DJI_MOTOR::read_from_master(buffer::Buffer *master_to_slave_buf) {
+        for (Motor &motor: motors_) {
+            if (!motor.is_exist) {
+                continue;
+            }
+            motor.command.is_enable.set(master_to_slave_buf->read_uint8(buffer::EndianType::LITTLE));
+            motor.command.cmd.set(master_to_slave_buf->read_int16(buffer::EndianType::LITTLE));
+        }
+    }
+
+    void DJI_MOTOR::on_connection_lost() {
+        if (connection_lost_action_ == ConnectionLostAction::RESET_TO_DEFAULT) {
+            for (Motor &motor: motors_) {
+                if (!motor.is_exist) {
+                    continue;
+                }
+                motor.command.is_enable.set(0);
+                motor.command.cmd.set(0);
+            }
+        }
+    }
+
+    void DJI_MOTOR::can_recv(FDCAN_RxHeaderTypeDef *rx_header, uint8_t *rx_data) {
+        for (Motor &motor: motors_) {
+            if (rx_header->Identifier != motor.report_packet_id) {
+                continue;
+            }
+            int index = 0;
+            motor.report.ecd.set(big_endian::read_uint16(rx_data, &index));
+            motor.report.rpm.set(big_endian::read_int16(rx_data, &index));
+            motor.report.current.set(big_endian::read_int16(rx_data, &index));
+            motor.report.temperature.set(big_endian::read_uint8(rx_data, &index));
+            motor.report.error.set(big_endian::read_uint8(rx_data, &index));
+            motor.report.last_receive_time.set_current();
+            return;
+        }
+    }
+
+    void DJI_MOTOR::run_task() {
+        memset(cmds_, 0, 8);
+
+        for (Motor &motor: motors_) {
+            if (!motor.is_exist) {
+                continue;
+            }
+            if (!motor.is_online()) {
+                continue;
+            }
+
+            if (motor.command.is_enable.get()) {
+                switch (motor.mode) {
+                    case CtrlMode::OPEN_LOOP_CURRENT: {
+                        cmds_[motor.cmd_packet_idx] = motor.command.cmd.get();
+                        break;
+                    }
+                    case CtrlMode::SPEED: {
+                        cmds_[motor.cmd_packet_idx] = static_cast<int16_t>(motor.speed_pid.calculate(
+                            motor.report.rpm.get(),
+                            motor.command.cmd.get()));
+                        break;
+                    }
+                    case CtrlMode::SINGLE_ROUND_POSITION: {
+                        cmds_[motor.cmd_packet_idx] = static_cast<int16_t>(motor.speed_pid.calculate(
+                            motor.report.rpm.get(),
+                            motor.angle_pid.calculate(
+                                0,
+                                calculate_err(
+                                    motor.report.ecd.get(),
+                                    motor.command.cmd.get())
+                            )
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        int index = 0;
+        for (const int16_t cmd: cmds_) {
+            big_endian::write_int16(cmd, shared_tx_buf_, &index);
+        }
+
+        send_packet();
+    }
+}
