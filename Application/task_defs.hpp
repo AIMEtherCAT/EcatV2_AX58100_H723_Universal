@@ -12,6 +12,7 @@
 #include "pid_utils.hpp"
 #include "thread_safe_utils.hpp"
 #include "crc_utils.hpp"
+#include "board_config.h"
 
 namespace aim::ecat::task {
     using namespace utils::thread_safety;
@@ -614,8 +615,8 @@ namespace aim::ecat::task {
     }
 
     namespace pwm {
-        constexpr uint32_t TIM2_FREQ = 275000000;
-        constexpr uint32_t TIM3_FREQ = 275000000;
+        constexpr uint32_t TIM2_FREQ = TIM2_FREQ_VAL;
+        constexpr uint32_t TIM3_FREQ = TIM3_FREQ_VAL;
 
         struct ControlCommand {
             uint16_t channel1{};
